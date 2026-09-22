@@ -1,7 +1,5 @@
-import json
-import sys
 import os
-from dataclasses import asdict
+import sys
 
 # Allow `database.*` imports when running with PYTHONPATH=scanner:project_root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -13,11 +11,12 @@ from services.ec2_scanner import EC2Scanner
 from services.iam_scanner import IAMScanner
 from services.s3_scanner import S3Scanner
 from services.risk_engine import RiskEngine
+from services.ai_explainer import AIExplainer
 
 from database.persistence import persist_scan
 
 
-def main():
+def run_scan():
     print("AWS Security Scanner")
     print("====================")
 
@@ -58,6 +57,52 @@ def main():
         print(f"Status:   {finding.status}")
         print(f"Message:  {finding.message}")
 
+    # ── Calculate and display risk score ──────────────────────────────────
+    total_risk_score = sum(f.get("risk_score", 0) for f in calculated_findings)
+    print(f"\nRisk Score: {total_risk_score}")
+
+    # ── AI Explanations (print-only; scanner results are unchanged) ───────
+    ai_explainer = AIExplainer()
+
+    print("\nAI Security Explanations")
+    print("=======================")
+    if ai_explainer.llm_enabled:
+        print("Using Groq for FAIL findings. Scanner status/severity are not modified.")
+    else:
+        print("Using local templates. Add GROQ_API_KEY to .env for LLM reasoning.")
+
+    resources_by_key = {
+        (result.service, result.resource_id): result
+        for result in all_scan_results
+    }
+
+    sorted_findings = sorted(
+        zip(all_findings, calculated_findings),
+        key=lambda x: x[1].get("risk_score", 0),
+        reverse=True,
+    )
+
+    for finding, calc_finding in sorted_findings:
+        print(f"\n[{finding.rule_id}] {finding.resource_id}")
+
+        if finding.status == "PASS":
+            print("✅ Status: PASS (No issue detected)")
+            continue
+
+        scan_result = resources_by_key.get((finding.service, finding.resource_id))
+        explanation = ai_explainer.explain_finding(
+            finding,
+            configuration=scan_result.configuration if scan_result else {},
+            region=scan_result.region if scan_result else None,
+            risk_score=calc_finding.get("risk_score", 0),
+        )
+
+        if explanation:
+            print(explanation)
+        else:
+            print(f"Status: {finding.status}")
+            print(f"Message: {finding.message}")
+
     # ── Persist to Supabase ───────────────────────────────────────────────
     print("\nPersisting to database...")
     scan = persist_scan(
@@ -69,6 +114,23 @@ def main():
     print(f"   Findings:    {scan.total_findings}")
     print(f"   Risk Score:  {scan.total_risk_score}")
 
+    return {
+        "scan_id": str(scan.id),
+        "total_resources": scan.total_resources,
+        "total_findings": scan.total_findings,
+        "risk_score": scan.total_risk_score,
+        "findings": [
+            {
+                "rule_id": f.rule_id,
+                "service": f.service,
+                "resource_id": f.resource_id,
+                "severity": f.severity,
+                "status": f.status,
+                "message": f.message,
+            }
+            for f in all_findings
+        ],
+    }
 
 if __name__ == "__main__":
-    main()
+    run_scan()
